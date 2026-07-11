@@ -41,6 +41,7 @@ transfer to the molar-convention model recommended in priors.py.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -236,8 +237,14 @@ def make_figure(res_60, res_900, res_2c, names_1c, names_2c, path: str) -> None:
 
     fig.suptitle("KinetiFlow-CP v2 — Phase-1 identifiability gate", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(path, dpi=130)
-    print(f"\n[figure] wrote {path}")
+
+    # Create the destination folder if it doesn't exist yet, so this works on a
+    # fresh clone / any machine rather than assuming a directory is present.
+    out = Path(path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    print(f"\n[figure] wrote {out}")
 
 
 def _heat(ax, M, names, title):
@@ -284,8 +291,11 @@ if __name__ == "__main__":
     print_report("STUDY B — two-compartment (+k_m), 0-900 s  [Damkohler check]",
                  TWO_PARAMS, res2c, SIGMA)
 
-    make_figure(res60, res900, res2c, SINGLE_PARAMS, TWO_PARAMS,
-                "/home/claude/identifiability_gate.png")
+    # Portable output path: <project_root>/figures/identifiability_gate.png
+    # (this file lives in <project_root>/src/, so parents[1] is the project root).
+    # The folder is created automatically if it doesn't exist.
+    FIG_PATH = Path(__file__).resolve().parents[1] / "figures" / "identifiability_gate.png"
+    make_figure(res60, res900, res2c, SINGLE_PARAMS, TWO_PARAMS, str(FIG_PATH))
 
     # ---- verdict ----------------------------------------------------------
     print(f"\n{'#'*72}\nVERDICT\n{'#'*72}")

@@ -163,6 +163,32 @@ class MechanisticODE(nn.Module):
         for p in (self.log_k_wash, self.log_k_on, self.log_k_off, self.log_B_max):
             p.requires_grad_(not frozen)
 
+    def freeze_residual(self, frozen: bool = True) -> None:
+        """Baseline A (pure-physics ceiling): lock the neural residual so only the
+        frozen known-physics + optics remain. Combined with freeze_physics() this
+        yields a fully non-learnable dynamics core."""
+        for p in self.residual.parameters():
+            p.requires_grad_(not frozen)
+
+    # -- identifiable-training-mode factory ------------------------------- #
+    @classmethod
+    def identifiable(cls, **overrides) -> "MechanisticODE":
+        """Build the model in IDENTIFIABLE TRAINING MODE.
+
+        identifiability.py proved that from the single output I_obs, alpha and
+        B_max are perfectly confounded and k_on/k_off/k_wash are not separately
+        recoverable; so we FREEZE k_wash/k_on/k_off/B_max at the priors.py values
+        and let only {alpha, beta (in MeasurementModel), neural residual} train.
+
+        `overrides` are forwarded to priors.to_ode_config() (e.g. residual_hidden).
+        The full-flexibility mode remains available via the normal constructor.
+        """
+        import priors as _P
+
+        # trainable_physics=False => the four log-parameters are created frozen.
+        cfg = _P.to_ode_config(trainable_physics=False, **overrides)
+        return cls(cfg)
+
     # -- vector field ----------------------------------------------------- #
     def forward(self, t: Tensor, z: Tensor) -> Tensor:
         L, C_f, C_b = z.unbind(dim=-1)
