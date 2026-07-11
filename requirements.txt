@@ -1,0 +1,10 @@
+torch>=2.2
+torchdiffeq>=0.2.4
+numpy>=1.26
+scipy>=1.11
+opencv-python>=4.9
+scikit-learn>=1.4
+pandas>=2.1
+matplotlib>=3.8
+tqdm>=4.66
+# added later for the conformal layer: pot>=0.9   (Wasserstein / optimal transport)
