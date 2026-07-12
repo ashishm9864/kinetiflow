@@ -245,6 +245,28 @@ class InformationAndConformalTests(unittest.TestCase):
         between, within, ratio = synthetic.early_window_separation(self.data)
         self.assertGreater(ratio, 3.0, (between, within, ratio))
 
+    def test_capture_raw_npy_frames_enter_analysis_loader(self):
+        import data_pipeline as pipeline
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            first = np.full((20, 30), 1000, dtype=np.uint16)
+            second = np.full((20, 30), 1000, dtype=np.uint16)
+            first[8:12, 10:20] = 800
+            second[8:12, 10:20] = 700
+            first[2:6, 2:7] = 600
+            second[2:6, 2:7] = 600
+            np.save(folder / "frame_000000_0000000000ms.npy", first)
+            np.save(folder / "frame_000001_0000001000ms.npy", second)
+            samples = pipeline.load_frames(folder)
+            self.assertEqual([sample.t_ms for sample in samples], [0.0, 1000.0])
+            trace = pipeline.extract_intensity_timeseries(
+                samples, (10, 8, 10, 4), grey_roi=(2, 2, 5, 4),
+                smooth_window=3, smooth_polyorder=1,
+            )
+            self.assertEqual(len(trace), 2)
+            self.assertGreater(trace.I_raw.iloc[0], trace.I_raw.iloc[1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from scipy.signal import savgol_filter
 
 ROI = tuple[int, int, int, int]
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
+RAW_ARRAY_EXTENSIONS = {".npy"}
 
 
 @dataclass(frozen=True)
@@ -81,8 +82,9 @@ def detect_munsell_n5_patch_roi(
     """
 
     _require_nonempty_frame(frame)
-    hsv = cv2.cvtColor(_as_bgr(frame), cv2.COLOR_BGR2HSV)
-    gray = _to_gray(frame)
+    detection_frame = _to_uint8_bgr(frame)
+    hsv = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY).astype(float)
 
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
@@ -291,16 +293,22 @@ def plot_timeseries(df: pd.DataFrame) -> None:
 
 def _load_frame_folder(path: Path, folder_fps: float) -> list[FrameSample]:
     frame_paths = sorted(
-        p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        p for p in path.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS | RAW_ARRAY_EXTENSIONS
     )
     if not frame_paths:
-        raise ValueError(f"No image frames found in folder: {path}")
+        raise ValueError(f"No image or raw .npy frames found in folder: {path}")
 
     samples: list[FrameSample] = []
     for idx, frame_path in enumerate(frame_paths):
-        frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-        if frame is None:
-            continue
+        if frame_path.suffix.lower() in RAW_ARRAY_EXTENSIONS:
+            frame = np.load(frame_path, allow_pickle=False)
+            if frame.ndim not in (2, 3) or not np.issubdtype(frame.dtype, np.number):
+                raise ValueError(f"Unsupported raw frame array {frame_path}: {frame.shape} {frame.dtype}")
+        else:
+            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
         t_ms = _timestamp_ms_from_name(frame_path)
         if t_ms is None:
             t_ms = 1000.0 * idx / folder_fps
@@ -374,6 +382,22 @@ def _as_bgr(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 3 and frame.shape[2] == 4:
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
     raise ValueError(f"Unsupported frame shape: {frame.shape}")
+
+
+def _to_uint8_bgr(frame: np.ndarray) -> np.ndarray:
+    """Scale uint10/12/16 raw arrays to uint8 for ROI detection only.
+
+    Quantitative ROI intensities continue to use the original sensor values.
+    """
+    bgr = _as_bgr(frame)
+    if bgr.dtype == np.uint8:
+        return bgr
+    values = bgr.astype(np.float32)
+    low, high = np.percentile(values, [1.0, 99.0])
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        raise ValueError("Raw frame has no usable dynamic range")
+    scaled = np.clip((values - low) * (255.0 / (high - low)), 0.0, 255.0)
+    return scaled.astype(np.uint8)
 
 
 def _validate_roi(frame: np.ndarray, roi: ROI) -> None:

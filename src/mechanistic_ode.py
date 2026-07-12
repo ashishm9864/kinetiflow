@@ -221,14 +221,25 @@ class MechanisticODE(nn.Module):
 
 
 class MeasurementModel(nn.Module):
-    """Separate optics: ``I = alpha*C_b + beta``."""
+    """Separate optics, linear by default with an explicit saturation option."""
 
-    def __init__(self, alpha: float = 20.0, beta: float = 25.0):
+    def __init__(
+        self,
+        alpha: float = 20.0,
+        beta: float = 25.0,
+        sigmoidal: bool = False,
+        k_sig: float = 1.0,
+    ):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(alpha)))
         self.beta = nn.Parameter(torch.tensor(float(beta)))
+        self.sigmoidal = bool(sigmoidal)
+        if self.sigmoidal:
+            self.k_sig = nn.Parameter(torch.tensor(float(k_sig)))
 
     def forward(self, C_b: Tensor) -> Tensor:
+        if self.sigmoidal:
+            return self.alpha * torch.tanh(self.k_sig * C_b) + self.beta
         return self.alpha * C_b + self.beta
 
 
