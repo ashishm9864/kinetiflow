@@ -35,6 +35,7 @@ import train as GB
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
+RUNS_DIR = RESULTS_DIR / "runs"
 CHECKPOINT_DIR = ROOT / "checkpoints"
 PREFIXES = (20.0, 30.0, 40.0, 50.0, 60.0)
 TARGET_COVERAGE = 0.90
@@ -134,8 +135,24 @@ def _train_models(
     split_seed: int,
     epochs: int,
     patience: int,
-) -> Dict[str, PointForecaster]:
+) -> Tuple[Dict[str, PointForecaster], Dict[str, str], Dict[str, float]]:
     models: Dict[str, PointForecaster] = {}
+    failures: Dict[str, str] = {}
+    timings: Dict[str, float] = {}
+
+    def capture(name: str, operation) -> Optional[Dict]:
+        started = time.time()
+        try:
+            result = operation()
+            timings[name] = time.time() - started
+            print(f"    {name:14s} {timings[name]:7.1f}s", flush=True)
+            return result
+        except Exception as exc:
+            timings[name] = time.time() - started
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            print(f"    {name:14s} FAILED after {timings[name]:.1f}s: {failures[name]}", flush=True)
+            return None
+
     for dynamics in ("physics_only", "residual_only", "graybox"):
         cfg = GB.TrainConfig(
             dynamics=dynamics,
@@ -144,7 +161,12 @@ def _train_models(
             patience=patience,
             seed=0,
         )
-        result = GB.train(roles["train"], roles["validation"], cfg)
+        result = capture(
+            dynamics,
+            lambda cfg=cfg: GB.train(roles["train"], roles["validation"], cfg),
+        )
+        if result is None:
+            continue
         models[dynamics] = result["model"]
         if split_seed == 0:
             GB.save_checkpoint(result, CHECKPOINT_DIR / f"{dynamics}_best.pt")
@@ -153,29 +175,41 @@ def _train_models(
         dynamics="graybox", tag="graybox_wr", epochs=epochs,
         patience=patience, seed=0, wr_beta=0.10,
     )
-    gray_wr = GB.train(
-        roles["train"], roles["validation"], gray_wr_cfg, roles["wr_reference"]
+    gray_wr = capture(
+        "graybox_wr",
+        lambda: GB.train(
+            roles["train"], roles["validation"], gray_wr_cfg, roles["wr_reference"]
+        ),
     )
-    models["graybox_wr"] = gray_wr["model"]
-    if split_seed == 0:
+    if gray_wr is not None:
+        models["graybox_wr"] = gray_wr["model"]
+    if gray_wr is not None and split_seed == 0:
         GB.save_checkpoint(gray_wr, CHECKPOINT_DIR / "graybox_wr_best.pt")
 
     tcn_cfg = TCN.TCNConfig(epochs=max(400, epochs * 5), patience=max(60, patience * 4), seed=0)
-    tcn = TCN.train_tcn(roles["train"], roles["validation"], tcn_cfg)
-    models["tcn"] = tcn["model"]
-    if split_seed == 0:
+    tcn = capture(
+        "tcn",
+        lambda: TCN.train_tcn(roles["train"], roles["validation"], tcn_cfg),
+    )
+    if tcn is not None:
+        models["tcn"] = tcn["model"]
+    if tcn is not None and split_seed == 0:
         TCN.save_checkpoint(tcn, CHECKPOINT_DIR / "tcn_baseline.pt")
 
     tcn_wr_cfg = TCN.TCNConfig(
         epochs=max(400, epochs * 5), patience=max(60, patience * 4), seed=0, wr_beta=0.10
     )
-    tcn_wr = TCN.train_tcn(
-        roles["train"], roles["validation"], tcn_wr_cfg, roles["wr_reference"]
+    tcn_wr = capture(
+        "tcn_wr",
+        lambda: TCN.train_tcn(
+            roles["train"], roles["validation"], tcn_wr_cfg, roles["wr_reference"]
+        ),
     )
-    models["tcn_wr"] = tcn_wr["model"]
-    if split_seed == 0:
+    if tcn_wr is not None:
+        models["tcn_wr"] = tcn_wr["model"]
+    if tcn_wr is not None and split_seed == 0:
         TCN.save_checkpoint(tcn_wr, CHECKPOINT_DIR / "tcn_wr_best.pt")
-    return models
+    return models, failures, timings
 
 
 def _predictions(
@@ -213,6 +247,8 @@ def _row(
     finite_decision = decision[np.isfinite(decision)]
     return {
         "record_type": "run",
+        "status": "success",
+        "error": "",
         "split_seed": split_seed,
         "model": model_name,
         "conformal": conformal_method,
@@ -240,6 +276,24 @@ def _row(
     }
 
 
+def _failure_rows(split_seed: int, model_name: str, error: str, elapsed_s: float) -> List[Dict]:
+    weighted_label = "WR-CP" if model_name.endswith("_wr") else "IW-CP"
+    return [
+        {
+            "record_type": "run",
+            "status": "failed",
+            "error": error,
+            "split_seed": split_seed,
+            "model": model_name,
+            "conformal": method,
+            "scenario": scenario,
+            "training_time_s": elapsed_s,
+        }
+        for method in ("SCP", weighted_label)
+        for scenario in ("clean", "ood")
+    ]
+
+
 def evaluate_split(
     data: Dict[str, torch.Tensor],
     external: Mapping[str, D.TraceBundle],
@@ -248,12 +302,14 @@ def evaluate_split(
     patience: int,
 ) -> List[Dict]:
     roles = D.grouped_role_split(data, split_seed)
-    models = _train_models(roles, split_seed, epochs, patience)
+    models, failures, timings = _train_models(roles, split_seed, epochs, patience)
     thresholds = C.lock_thresholds(
         roles["calibration"].true_I_900,
         roles["calibration"].concentration_level,
     )
     rows: List[Dict] = []
+    for model_name, error in failures.items():
+        rows.extend(_failure_rows(split_seed, model_name, error, timings[model_name]))
 
     for model_name, model in models.items():
         cal_pred = _predictions(model, roles["calibration"])
@@ -284,6 +340,7 @@ def evaluate_split(
                 prediction=prediction_by_prefix[60.0], bundle=bundle,
                 lo=lo, hi=hi, thresholds=thresholds, decision=decision,
             ))
+            rows[-1]["training_time_s"] = timings[model_name]
 
         # Importance weighting on the untouched calibration scores.  The final
         # test rows and outcomes are absent from density fitting and calibration.
@@ -322,6 +379,7 @@ def evaluate_split(
                 ess_fraction=diagnostics.ess_fraction,
                 density_auc=diagnostics.density_ratio.cv_auc,
             ))
+            rows[-1]["training_time_s"] = timings[model_name]
 
         if model_name in {"physics_only", "residual_only", "graybox"}:
             inferred = model.infer_cf0(inputs_from_bundle(roles["test"], 60.0))
@@ -343,6 +401,16 @@ def _aggregate(frame: pd.DataFrame) -> pd.DataFrame:
     grouped = frame.groupby(["model", "conformal", "scenario"], dropna=False)[present]
     mean = grouped.mean().reset_index()
     std = grouped.std().reset_index()
+    counts = (
+        frame.groupby(["model", "conformal", "scenario"], dropna=False)["status"]
+        .agg(
+            n_runs="size",
+            n_success=lambda values: int((values == "success").sum()),
+            n_failed=lambda values: int((values == "failed").sum()),
+        )
+        .reset_index()
+    )
+    mean = mean.merge(counts, on=["model", "conformal", "scenario"], how="left")
     mean["record_type"] = "aggregate_mean"
     std["record_type"] = "aggregate_sd"
     mean["split_seed"] = -1
@@ -384,7 +452,7 @@ def _markdown(frame: pd.DataFrame, n_splits: int) -> str:
     ]
     primary = primary[columns].sort_values(["conformal", "model"])
 
-    run = frame[frame.record_type == "run"]
+    run = frame[(frame.record_type == "run") & (frame.status == "success")]
     drops = []
     for keys, group in run.groupby(["split_seed", "model", "conformal"]):
         clean = group[group.scenario == "clean"]
@@ -421,22 +489,87 @@ def _markdown(frame: pd.DataFrame, n_splits: int) -> str:
     return "\n".join(lines)
 
 
-def run_evaluation(n_splits: int, epochs: int, patience: int) -> pd.DataFrame:
+def _expected_split_keys() -> set[Tuple[str, str, str]]:
+    models = ("physics_only", "residual_only", "graybox", "graybox_wr", "tcn", "tcn_wr")
+    keys = set()
+    for model in models:
+        weighted = "WR-CP" if model.endswith("_wr") else "IW-CP"
+        for method in ("SCP", weighted):
+            for scenario in ("clean", "ood"):
+                keys.add((model, method, scenario))
+    return keys
+
+
+def _complete_split_frame(frame: pd.DataFrame, split_seed: int) -> bool:
+    required = {"record_type", "status", "split_seed", "model", "conformal", "scenario"}
+    if not required.issubset(frame.columns) or len(frame) != 24:
+        return False
+    if set(frame["split_seed"].astype(int)) != {split_seed}:
+        return False
+    if not set(frame["status"]).issubset({"success", "failed"}):
+        return False
+    keys = set(zip(frame["model"], frame["conformal"], frame["scenario"]))
+    return keys == _expected_split_keys() and not frame.duplicated(
+        ["model", "conformal", "scenario"]
+    ).any()
+
+
+def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False)
+    temporary.replace(path)
+
+
+def run_evaluation(
+    n_splits: int,
+    epochs: int,
+    patience: int,
+    *,
+    resume: bool = False,
+    runs_dir: Path = RUNS_DIR,
+) -> pd.DataFrame:
     data = D.load()
     external = _external_sets()
-    rows: List[Dict] = []
     started = time.time()
     for seed in range(n_splits):
+        split_path = runs_dir / f"split_{seed:03d}.csv"
+        if resume and split_path.exists():
+            cached = pd.read_csv(split_path)
+            if _complete_split_frame(cached, seed):
+                print(f"split {seed + 1:02d}/{n_splits}: resume hit ({split_path.name})", flush=True)
+                continue
+            print(f"split {seed + 1:02d}/{n_splits}: invalid cache; recomputing", flush=True)
         split_started = time.time()
-        rows.extend(evaluate_split(data, external, seed, epochs, patience))
+        print(f"split {seed + 1:02d}/{n_splits}: training", flush=True)
+        split_rows = pd.DataFrame(evaluate_split(data, external, seed, epochs, patience))
+        if not _complete_split_frame(split_rows, seed):
+            raise RuntimeError(f"split {seed} produced an incomplete result matrix")
+        _atomic_write_csv(split_rows, split_path)
+        D.save_manifest(
+            D.grouped_role_split(data, seed), seed,
+            runs_dir / f"split_{seed:03d}_manifest.json",
+        )
         elapsed = time.time() - split_started
         total = time.time() - started
-        print(f"split {seed + 1:02d}/{n_splits}: {elapsed:.1f}s (total {total / 60:.1f} min)", flush=True)
-    runs = pd.DataFrame(rows)
+        print(
+            f"split {seed + 1:02d}/{n_splits}: persisted in {elapsed:.1f}s "
+            f"(total {total / 60:.1f} min)", flush=True,
+        )
+    frames = []
+    for seed in range(n_splits):
+        split_path = runs_dir / f"split_{seed:03d}.csv"
+        if not split_path.exists():
+            raise RuntimeError(f"missing completed split artifact: {split_path}")
+        frame = pd.read_csv(split_path)
+        if not _complete_split_frame(frame, seed):
+            raise RuntimeError(f"invalid completed split artifact: {split_path}")
+        frames.append(frame)
+    runs = pd.concat(frames, ignore_index=True, sort=False)
     aggregate = _aggregate(runs)
     frame = pd.concat([runs, aggregate], ignore_index=True, sort=False)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(RESULTS_DIR / "metrics.csv", index=False)
+    _atomic_write_csv(frame, RESULTS_DIR / "metrics.csv")
     (RESULTS_DIR / "metrics.md").write_text(_markdown(frame, n_splits))
     D.save_manifest(D.grouped_role_split(data, 0), 0, RESULTS_DIR / "split_manifest_seed0.json")
     return frame
@@ -447,10 +580,15 @@ def main() -> None:
     parser.add_argument("--splits", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
     args = parser.parse_args()
     if args.splits < 1:
         raise ValueError("--splits must be positive")
-    frame = run_evaluation(args.splits, args.epochs, args.patience)
+    frame = run_evaluation(
+        args.splits, args.epochs, args.patience,
+        resume=args.resume, runs_dir=args.runs_dir,
+    )
     primary = frame[
         (frame.record_type == "aggregate_mean")
         & (frame.scenario == "clean")
