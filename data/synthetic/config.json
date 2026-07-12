@@ -1,0 +1,29 @@
+{
+  "nominal_mIU_per_mL": 25.0,
+  "conc_levels": [
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    5.0
+  ],
+  "n_groups": 20,
+  "reps_per_level": 3,
+  "group_id_offset": 0,
+  "T_nominal": 30.0,
+  "T_between_sd": 1.5,
+  "T_within_sd": 0.5,
+  "RH_nominal": 55.0,
+  "RH_between_sd": 4.0,
+  "RH_within_sd": 2.0,
+  "group_effect_scale": 1.0,
+  "mismatch_scale": 1.0,
+  "mismatch_mechanism": "combined",
+  "alpha_true": 20.0,
+  "beta_true": 25.0,
+  "noise_std_dn": 0.4,
+  "t_end": 900.0,
+  "n_t": 91,
+  "early_window_s": 60.0,
+  "seed": 12345
+}

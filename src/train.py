@@ -109,7 +109,7 @@ class LatentODEForecaster(nn.Module):
         self.cfg = cfg
         self.encoder = LatentStateEncoder(cfg.encoder_hidden)
         self.core = MechanisticODE.identifiable(dynamics=cfg.dynamics)
-        self.measurement = MeasurementModel(alpha=2.0, beta=25.0)
+        self.measurement = MeasurementModel(alpha=20.0, beta=25.0)
         self.register_buffer("target_mean", torch.tensor(0.0))
         self.register_buffer("target_std", torch.tensor(1.0))
 

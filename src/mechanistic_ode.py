@@ -221,7 +221,7 @@ class MechanisticODE(nn.Module):
 class MeasurementModel(nn.Module):
     """Separate optics: ``I = alpha*C_b + beta``."""
 
-    def __init__(self, alpha: float = 2.0, beta: float = 25.0):
+    def __init__(self, alpha: float = 20.0, beta: float = 25.0):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(alpha)))
         self.beta = nn.Parameter(torch.tensor(float(beta)))

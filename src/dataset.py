@@ -1,145 +1,105 @@
-"""
-dataset.py
-==========
-Load the synthetic LFA traces and build LEAKAGE-SAFE grouped splits for
-KinetiFlow-CP v2.
-
-Splitting rule (non-negotiable, see CLAUDE.md): no experimental DAY and no strip
-LOT may appear in more than one of {train, calibration, test}. Because a single
-trace ties one day to one lot, days and lots are entangled: if day 3 and lot 7
-ever co-occur, they must live in the same split. We therefore:
-
-  1. Build a bipartite graph with a node per day and per lot; every trace adds an
-     edge day <-> lot.
-  2. Union-find the connected components. Each component is an ATOMIC group — the
-     smallest set of days+lots that can move between splits without leaking.
-  3. Greedily pack whole components into train / cal / test to approach the
-     60 / 20 / 20 target by trace count.
-
-This guarantees, by construction, zero day and zero lot overlap across splits;
-the __main__ self-test asserts it.
-"""
+"""Leakage-safe grouped data roles and persisted split manifests."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch import Tensor
 
 
 DEFAULT_PATH = Path(__file__).resolve().parents[1] / "data" / "synthetic" / "traces.pt"
+ROLE_FRACTIONS: Mapping[str, float] = {
+    "train": 0.50,
+    "validation": 0.10,
+    "wr_reference": 0.10,
+    "calibration": 0.15,
+    "test": 0.15,
+}
 
 
-# --------------------------------------------------------------------------- #
-#  Trace bundle                                                               #
-# --------------------------------------------------------------------------- #
 @dataclass
 class TraceBundle:
-    """A split's worth of traces as a bundle of aligned tensors."""
     name: str
-    idx: Tensor              # [n] original row indices into the full dataset
-    t: Tensor                # [T] shared time grid
-    I_obs: Tensor            # [n, T] noisy observed intensity
-    C_f0: Tensor             # [n] initial free-analyte conc (z0 seed)
-    T_ambient: Tensor        # [n] covariate
-    RH: Tensor               # [n] covariate
-    day: Tensor              # [n]
-    lot: Tensor              # [n]
-    concentration_level: Tensor  # [n]
-    true_I_900: Tensor       # [n] noise-free 900 s equilibrium target
+    idx: Tensor
+    t: Tensor
+    I_obs: Tensor
+    C_f0: Tensor
+    T_ambient: Tensor
+    RH: Tensor
+    day: Tensor
+    lot: Tensor
+    group_id: Tensor
+    concentration_level: Tensor
+    true_I_900: Tensor
 
     def __len__(self) -> int:
         return int(self.idx.numel())
 
-    def days(self) -> set:
-        return set(int(x) for x in self.day.tolist())
+    def days(self) -> set[int]:
+        return set(map(int, self.day.tolist()))
 
-    def lots(self) -> set:
-        return set(int(x) for x in self.lot.tolist())
+    def lots(self) -> set[int]:
+        return set(map(int, self.lot.tolist()))
+
+    def groups(self) -> set[int]:
+        return set(map(int, self.group_id.tolist()))
 
 
-# --------------------------------------------------------------------------- #
-#  Loading                                                                    #
-# --------------------------------------------------------------------------- #
 def load(path: str | Path = DEFAULT_PATH) -> Dict[str, Tensor]:
     path = Path(path).expanduser().resolve()
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found — run `python src/synthetic.py` first.")
-    return torch.load(path, weights_only=False)
+        raise FileNotFoundError(f"{path} not found; run python src/synthetic.py")
+    data = torch.load(path, weights_only=False)
+    if "group_id" not in data:
+        data["group_id"] = data["lot"].clone()
+    return data
 
 
-# --------------------------------------------------------------------------- #
-#  Union-find for atomic (day, lot) groups                                    #
-# --------------------------------------------------------------------------- #
 class _UnionFind:
     def __init__(self):
         self.parent: Dict[object, object] = {}
 
-    def find(self, x):
-        self.parent.setdefault(x, x)
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:            # path compression
-            self.parent[x], x = root, self.parent[x]
-        return root
+    def find(self, item):
+        self.parent.setdefault(item, item)
+        if self.parent[item] != item:
+            self.parent[item] = self.find(self.parent[item])
+        return self.parent[item]
 
-    def union(self, a, b):
+    def union(self, a, b) -> None:
         ra, rb = self.find(a), self.find(b)
         if ra != rb:
             self.parent[ra] = rb
 
 
-def _atomic_groups(day: Tensor, lot: Tensor) -> List[List[int]]:
-    """Return lists of trace indices, one per connected (day/lot) component."""
-    uf = _UnionFind()
-    n = int(day.numel())
-    for i in range(n):
-        uf.union(("day", int(day[i])), ("lot", int(lot[i])))
-
+def atomic_groups(day: Tensor, lot: Tensor) -> List[List[int]]:
+    """Connected day/lot components; the indivisible unit of assignment."""
+    union = _UnionFind()
+    for i in range(day.numel()):
+        union.union(("day", int(day[i])), ("lot", int(lot[i])))
     groups: Dict[object, List[int]] = {}
-    for i in range(n):
-        root = uf.find(("day", int(day[i])))
-        groups.setdefault(root, []).append(i)
-    # deterministic order: largest component first
-    return sorted(groups.values(), key=len, reverse=True)
+    for i in range(day.numel()):
+        groups.setdefault(union.find(("day", int(day[i]))), []).append(i)
+    return sorted(groups.values(), key=lambda x: min(x))
 
 
-# --------------------------------------------------------------------------- #
-#  Grouped split                                                              #
-# --------------------------------------------------------------------------- #
-def grouped_split(
-    data: Dict[str, Tensor],
-    fracs: Tuple[float, float, float] = (0.6, 0.2, 0.2),
-) -> Tuple[TraceBundle, TraceBundle, TraceBundle]:
-    """Leakage-safe train/cal/test split grouped by (day AND lot).
-
-    Whole (day, lot) connected components are packed greedily so each split
-    approaches its target trace fraction; days and lots never cross splits.
-    """
-    day, lot = data["day"], data["lot"]
-    N = int(day.numel())
-    groups = _atomic_groups(day, lot)
-
-    names = ["train", "cal", "test"]
-    targets = [f * N for f in fracs]
-    assigned: Dict[str, List[int]] = {n: [] for n in names}
-
-    # Greedy: give each component to the split most under-filled vs its target.
-    for members in groups:
-        deficits = [targets[k] - len(assigned[names[k]]) for k in range(3)]
-        pick = int(max(range(3), key=lambda k: deficits[k]))
-        assigned[names[pick]].extend(members)
-
-    bundles = tuple(_make_bundle(n, sorted(assigned[n]), data) for n in names)
-    return bundles  # type: ignore[return-value]
+def _role_counts(n_groups: int, fractions: Mapping[str, float]) -> Dict[str, int]:
+    raw = {name: n_groups * frac for name, frac in fractions.items()}
+    counts = {name: int(np.floor(value)) for name, value in raw.items()}
+    remaining = n_groups - sum(counts.values())
+    order = sorted(raw, key=lambda name: raw[name] - counts[name], reverse=True)
+    for name in order[:remaining]:
+        counts[name] += 1
+    if any(value == 0 for value in counts.values()):
+        raise ValueError(f"not enough atomic groups for all roles: {counts}")
+    return counts
 
 
-def _make_bundle(name: str, indices: List[int], data: Dict[str, Tensor]) -> TraceBundle:
-    idx = torch.tensor(indices, dtype=torch.long)
+def _make_bundle(name: str, indices: Sequence[int], data: Dict[str, Tensor]) -> TraceBundle:
+    idx = torch.tensor(sorted(map(int, indices)), dtype=torch.long)
     return TraceBundle(
         name=name,
         idx=idx,
@@ -150,43 +110,79 @@ def _make_bundle(name: str, indices: List[int], data: Dict[str, Tensor]) -> Trac
         RH=data["RH"][idx],
         day=data["day"][idx],
         lot=data["lot"][idx],
+        group_id=data.get("group_id", data["lot"])[idx],
         concentration_level=data["concentration_level"][idx],
         true_I_900=data["true_I_900"][idx],
     )
 
 
-def assert_no_leakage(train: TraceBundle, cal: TraceBundle, test: TraceBundle) -> None:
-    """Raise AssertionError if any day or lot appears in more than one split."""
-    for a, b in ((train, cal), (train, test), (cal, test)):
-        day_overlap = a.days() & b.days()
-        lot_overlap = a.lots() & b.lots()
-        assert not day_overlap, f"DAY leakage {a.name}<->{b.name}: {day_overlap}"
-        assert not lot_overlap, f"LOT leakage {a.name}<->{b.name}: {lot_overlap}"
+def grouped_role_split(
+    data: Dict[str, Tensor],
+    seed: int = 0,
+    fractions: Mapping[str, float] = ROLE_FRACTIONS,
+) -> Dict[str, TraceBundle]:
+    """Randomly assign whole atomic day/lot components to disjoint roles."""
+    if not np.isclose(sum(fractions.values()), 1.0):
+        raise ValueError("role fractions must sum to one")
+    groups = atomic_groups(data["day"], data["lot"])
+    counts = _role_counts(len(groups), fractions)
+    order = np.random.default_rng(seed).permutation(len(groups)).tolist()
+    bundles: Dict[str, TraceBundle] = {}
+    cursor = 0
+    for role in fractions:
+        chosen = order[cursor:cursor + counts[role]]
+        cursor += counts[role]
+        indices = [i for group_index in chosen for i in groups[group_index]]
+        bundles[role] = _make_bundle(role, indices, data)
+    assert_no_leakage(*bundles.values())
+    return bundles
 
 
-# --------------------------------------------------------------------------- #
-#  Self-test                                                                  #
-# --------------------------------------------------------------------------- #
+def grouped_split(data: Dict[str, Tensor]) -> Tuple[TraceBundle, TraceBundle, TraceBundle]:
+    """Compatibility wrapper; new code must use :func:`grouped_role_split`."""
+    roles = grouped_role_split(data)
+    train_indices = torch.cat([roles["train"].idx, roles["validation"].idx, roles["wr_reference"].idx])
+    return (
+        _make_bundle("train", train_indices.tolist(), data),
+        roles["calibration"],
+        roles["test"],
+    )
+
+
+def assert_no_leakage(*bundles: TraceBundle) -> None:
+    for i, left in enumerate(bundles):
+        for right in bundles[i + 1:]:
+            day_overlap = left.days() & right.days()
+            lot_overlap = left.lots() & right.lots()
+            if day_overlap or lot_overlap:
+                raise AssertionError(
+                    f"group leakage {left.name}<->{right.name}: days={day_overlap}, lots={lot_overlap}"
+                )
+
+
+def manifest(bundles: Mapping[str, TraceBundle], seed: int) -> Dict:
+    return {
+        "seed": seed,
+        "roles": {
+            name: {
+                "n": len(bundle),
+                "indices": bundle.idx.tolist(),
+                "days": sorted(bundle.days()),
+                "lots": sorted(bundle.lots()),
+                "groups": sorted(bundle.groups()),
+            }
+            for name, bundle in bundles.items()
+        },
+    }
+
+
+def save_manifest(bundles: Mapping[str, TraceBundle], seed: int, path: str | Path) -> None:
+    Path(path).write_text(json.dumps(manifest(bundles, seed), indent=2) + "\n")
+
+
 if __name__ == "__main__":
-    data = load()
-    N = int(data["day"].numel())
-    train, cal, test = grouped_split(data)
-
-    print("== grouped split (leakage-safe by day AND lot) ==")
-    for b in (train, cal, test):
-        frac = len(b) / N
-        print(f"   {b.name:5s}: {len(b):3d} traces ({frac*100:4.1f}%)  "
-              f"days={sorted(b.days())}  lots={sorted(b.lots())}")
-
-    assert_no_leakage(train, cal, test)
-    assert len(train) + len(cal) + len(test) == N, "split does not cover all traces"
-
-    # Explicit overlap report for the acceptance test.
-    print("\n== leakage check ==")
-    print(f"   train/cal  day overlap : {sorted(train.days() & cal.days())}")
-    print(f"   train/test day overlap : {sorted(train.days() & test.days())}")
-    print(f"   cal/test   day overlap : {sorted(cal.days() & test.days())}")
-    print(f"   train/cal  lot overlap : {sorted(train.lots() & cal.lots())}")
-    print(f"   train/test lot overlap : {sorted(train.lots() & test.lots())}")
-    print(f"   cal/test   lot overlap : {sorted(cal.lots() & test.lots())}")
-    print("\nNO DAY OR LOT LEAKAGE: PASS")
+    roles = grouped_role_split(load(), seed=0)
+    for name, bundle in roles.items():
+        print(f"{name:12s} n={len(bundle):3d} groups={sorted(bundle.groups())}")
+    assert_no_leakage(*roles.values())
+    print("G7 ZERO DAY/LOT OVERLAP: PASS")
