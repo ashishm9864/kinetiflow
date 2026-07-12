@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 data/raw/
 .idea/
+
+# Regenerable binaries (produced by synthetic.py / train.py — do not version)
+checkpoints/*.pt
+data/synthetic/*.pt

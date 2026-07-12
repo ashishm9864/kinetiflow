@@ -39,24 +39,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CKPT_DIR = ROOT / "checkpoints"
 FIG_DIR = ROOT / "figures"
 
-# Residual input normalization matched to the ACTUAL operating ranges of the
-# synthetic assay (C_f ~ 0-13 ng/mL, C_b ~ 0-0.06 ug/cm^2). The ODEConfig
-# defaults assume C_b ~ 0.5, which compresses the C_b feature to a near-constant
-# and blinds the residual to the cooperative term — matching it is essential for
-# the residual to actually learn the model mismatch.
-#            (C_f,   C_b,   t,     T,    RH)
-RES_MEAN =  (4.0,   0.025, 450.0, 30.0, 55.0)
-RES_SCALE = (5.0,   0.025, 450.0, 3.0,  8.0)
-
-
-def _build_core() -> MechanisticODE:
-    """Identifiable-mode core with operating-range-matched residual normalization
-    and the residual initialized to output exactly zero (pure physics)."""
-    core = MechanisticODE.identifiable(res_mean=RES_MEAN, res_scale=RES_SCALE)
-    _zero_residual_output(core)
-    return core
-
-
 # --------------------------------------------------------------------------- #
 #  Configuration                                                              #
 # --------------------------------------------------------------------------- #
@@ -198,6 +180,37 @@ def init_optics(model: MechanisticODE, meas: MeasurementModel,
 
 
 # --------------------------------------------------------------------------- #
+#  Operating-range-matched residual input normalization                       #
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def _set_residual_norm(model: "GrayBoxUDE", meas: MeasurementModel,
+                       bundle: "D.TraceBundle", cfg: TrainConfig,
+                       eps: float = 1e-6) -> None:
+    """Center/scale the residual inputs (C_f, C_b, t, T, RH) to their ACTUAL
+    operating range, measured from a pure-physics rollout of the TRAIN split.
+
+    The ODEConfig default normalization assumes C_b ~ 0.5, but the assay operates
+    at C_b ~ 0-0.06, so C_b collapses to a near-constant feature and the residual
+    is blind to the cooperative-term mismatch. Deriving mean/scale from data (not
+    hardcoded constants) makes this generalize to real strips. This must be called
+    while the residual output is still zeroed, so the rollout is pure physics and
+    independent of the normalization being set. The stats are written into the
+    core.res_mean/res_scale buffers, which travel with the checkpoint so inference
+    uses the identical normalization."""
+    z0, t, _, T_amb, RH = make_batch(bundle, cfg.L0)
+    z, _ = integrate_batch(model, meas, z0, t, T_amb, RH, cfg, use_adjoint=False)
+    C_f, C_b = z[..., 1], z[..., 2]                      # [T, B]
+    feats = torch.stack([
+        C_f, C_b,
+        t.view(-1, 1).expand_as(C_f),
+        T_amb.view(1, -1).expand_as(C_f),
+        RH.view(1, -1).expand_as(C_f),
+    ], dim=-1).reshape(-1, 5)                            # [T*B, 5]
+    model.core.res_mean.copy_(feats.mean(0))
+    model.core.res_scale.copy_(feats.std(0).clamp_min(eps))
+
+
+# --------------------------------------------------------------------------- #
 #  Evaluation                                                                 #
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -224,6 +237,7 @@ def train(train_bundle: "D.TraceBundle", cal_bundle: "D.TraceBundle",
     if cfg.physics_only:
         core.freeze_residual(True)                 # Baseline A: pure-physics ceiling
 
+    _set_residual_norm(model, meas, train_bundle, cfg)  # operating-range-matched norm
     init_optics(model, meas, train_bundle, cfg)    # scale-correct optics start
 
     params = [{"params": [p for p in model.residual.parameters() if p.requires_grad],
@@ -231,6 +245,9 @@ def train(train_bundle: "D.TraceBundle", cal_bundle: "D.TraceBundle",
               {"params": [meas.alpha, meas.beta], "lr": cfg.lr_optics}]
     params = [g for g in params if len(g["params"]) > 0]
     opt = torch.optim.Adam(params)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", factor=cfg.sched_factor,
+        patience=cfg.sched_patience, min_lr=cfg.min_lr)
 
     z0, t, I_target, T_amb, RH = make_batch(train_bundle, cfg.L0)
 
@@ -260,7 +277,8 @@ def train(train_bundle: "D.TraceBundle", cal_bundle: "D.TraceBundle",
         opt.step()
 
         cal_total, cal_parts, _ = eval_loss(model, meas, cal_bundle, cfg)
-        history["train"].append(float(total))
+        sched.step(cal_total)                          # decay residual/optics lr on plateau
+        history["train"].append(float(total.detach()))
         history["cal"].append(cal_total)
         history["train_obs"].append(parts["obs"])
         history["cal_obs"].append(cal_parts["obs"])
