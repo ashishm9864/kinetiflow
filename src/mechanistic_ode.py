@@ -195,11 +195,13 @@ class MechanisticODE(nn.Module):
 
     def forward(self, t: Tensor, z: Tensor) -> Tensor:
         L, C_f, C_b = z.unbind(dim=-1)
-        if bool(torch.any(L <= 0.0)):
-            raise ValueError("L must stay > 0; t=0 is front arrival at the read window")
-        dL = self.k_wash / L
-        volume = self.volume_mL(L)
-        dvolume = self.dvolume_dt_mL_s(L, dL)
+        # The public integration boundary rejects L0<=0.  Adaptive RK stages in
+        # the reverse adjoint may transiently extrapolate outside the physical
+        # domain, so the vector field itself uses a numerical floor.
+        L_safe = L.clamp_min(self.eps_t)
+        dL = self.k_wash / L_safe
+        volume = self.volume_mL(L_safe)
+        dvolume = self.dvolume_dt_mL_s(L_safe, dL)
         flux, _ = self.reaction_flux(t, C_f, C_b)
 
         # 1 nmol/m^2 of bound hCG over area A has mass A*MW_HCG ng.

@@ -33,6 +33,7 @@ class TCNConfig:
     grad_clip: float = 1.0
     window_s: float = 60.0
     prefix_min_s: float = 20.0
+    wr_beta: float = 0.0
     seed: int = 0
 
 
@@ -134,6 +135,7 @@ def train_tcn(
     train_bundle: D.TraceBundle,
     validation_bundle: D.TraceBundle,
     cfg: Optional[TCNConfig] = None,
+    wr_reference: Optional[D.TraceBundle] = None,
 ) -> Dict:
     cfg = cfg or TCNConfig()
     torch.manual_seed(cfg.seed)
@@ -145,6 +147,12 @@ def train_tcn(
     best_epoch = -1
     stale = 0
     history = {"train": [], "validation_rmse": []}
+    resamples = None
+    if cfg.wr_beta > 0.0:
+        if wr_reference is None:
+            raise ValueError("wr_beta>0 requires a disjoint WR-reference bundle")
+        from train import _wr_resamples
+        resamples = _wr_resamples(train_bundle, wr_reference, cfg.seed)
     for epoch in range(cfg.epochs):
         model.train()
         inputs = _prefix(train_bundle, cfg, epoch)
@@ -152,6 +160,19 @@ def train_tcn(
         prediction = model(model.standardized(inputs))
         target = (train_bundle.true_I_900 - model.y_mean) / model.y_std
         loss = torch.mean((prediction - target) ** 2)
+        if cfg.wr_beta > 0.0:
+            assert wr_reference is not None and resamples is not None
+            reference_inputs = _prefix(wr_reference, cfg, epoch)
+            reference_prediction = model(model.standardized(reference_inputs))
+            reference_target = (wr_reference.true_I_900 - model.y_mean) / model.y_std
+            source_scores = torch.abs(prediction - target)
+            reference_scores = torch.abs(reference_prediction - reference_target)
+            distances = []
+            for group, ref_index in resamples.items():
+                source = torch.sort(source_scores[train_bundle.group_id == group]).values
+                weighted_reference = torch.sort(reference_scores[ref_index]).values
+                distances.append(torch.mean(torch.abs(source - weighted_reference)))
+            loss = loss + cfg.wr_beta * torch.stack(distances).mean()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()

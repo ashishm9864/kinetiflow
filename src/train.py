@@ -38,7 +38,7 @@ class TrainConfig:
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
     endpoint_weight: float = 1.0
-    reconstruction_weight: float = 0.20
+    reconstruction_weight: float = 0.05
     method: str = "dopri5"
     rtol: float = 1e-5
     atol: float = 1e-7
@@ -48,6 +48,7 @@ class TrainConfig:
     prefix_min_s: float = 20.0
     seed: int = 0
     encoder_hidden: int = 16
+    wr_beta: float = 0.0
     tag: str = "graybox"
 
     @property
@@ -67,9 +68,10 @@ class LatentStateEncoder(nn.Module):
         self.gru = nn.GRU(input_size=4, hidden_size=hidden, batch_first=True)
         self.head = nn.Linear(hidden, 1)
         nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, -0.2)
+        nn.init.constant_(self.head.bias, -3.0)
         self.register_buffer("I_mean", torch.tensor(0.0))
         self.register_buffer("I_std", torch.tensor(1.0))
+        self.register_buffer("I_noise", torch.tensor(1.0))
         self.register_buffer("T_mean", torch.tensor(30.0))
         self.register_buffer("T_std", torch.tensor(1.0))
         self.register_buffer("RH_mean", torch.tensor(55.0))
@@ -80,6 +82,10 @@ class LatentStateEncoder(nn.Module):
     def fit_normalization(self, inputs: ForecastInputs) -> None:
         self.I_mean.copy_(inputs.I_early.mean())
         self.I_std.copy_(inputs.I_early.std().clamp_min(1e-6))
+        difference = inputs.I_early[:, 1:] - inputs.I_early[:, :-1]
+        centered = difference - difference.median()
+        robust_noise = centered.abs().median() / 0.9538725524
+        self.I_noise.copy_(robust_noise.clamp_min(0.1))
         self.T_mean.copy_(inputs.T_ambient.mean())
         self.T_std.copy_(inputs.T_ambient.std().clamp_min(1e-6))
         self.RH_mean.copy_(inputs.RH.mean())
@@ -190,26 +196,110 @@ def _loss(
     inputs: ForecastInputs,
     *,
     use_adjoint: bool,
-) -> Tuple[Tensor, Dict[str, float]]:
+) -> Tuple[Tensor, Dict[str, float], Tensor]:
     t_eval = torch.cat([inputs.t, torch.tensor([900.0], dtype=inputs.t.dtype)])
     _, pred = model.integrate(inputs, t_eval, use_adjoint=use_adjoint)
     endpoint = torch.mean(((pred[-1] - bundle.true_I_900) / model.target_std) ** 2)
-    reconstruction = torch.mean(((pred[:-1].transpose(0, 1) - inputs.I_early) / model.encoder.I_std) ** 2)
+    reconstruction = torch.mean(
+        ((pred[:-1].transpose(0, 1) - inputs.I_early) / model.encoder.I_noise) ** 2
+    )
     total = model.cfg.endpoint_weight * endpoint + model.cfg.reconstruction_weight * reconstruction
     return total, {
         "endpoint": float(endpoint.detach()),
         "reconstruction": float(reconstruction.detach()),
-    }
+    }, pred[-1]
 
 
 @torch.no_grad()
 def evaluate_loss(model: LatentODEForecaster, bundle: D.TraceBundle, window_s: float = 60.0) -> float:
     inputs = inputs_from_bundle(bundle, window_s)
-    loss, _ = _loss(model, bundle, inputs, use_adjoint=False)
+    loss, _, _ = _loss(model, bundle, inputs, use_adjoint=False)
     return float(loss)
 
 
-def train(train_bundle: D.TraceBundle, validation_bundle: D.TraceBundle, cfg: TrainConfig) -> Dict:
+def _combine_inputs(left: ForecastInputs, right: ForecastInputs) -> ForecastInputs:
+    if not torch.equal(left.t, right.t):
+        raise ValueError("WR source/reference prefixes use different time grids")
+    return ForecastInputs(
+        left.t,
+        torch.cat([left.I_early, right.I_early], dim=0),
+        torch.cat([left.T_ambient, right.T_ambient], dim=0),
+        torch.cat([left.RH, right.RH], dim=0),
+    )
+
+
+def _systematic_indices(weights: np.ndarray, n: int) -> Tensor:
+    probability = np.asarray(weights, dtype=np.float64)
+    probability = probability / probability.sum()
+    cdf = np.cumsum(probability)
+    positions = (np.arange(n, dtype=np.float64) + 0.5) / n
+    return torch.tensor(np.searchsorted(cdf, positions, side="left"), dtype=torch.long)
+
+
+def _wr_resamples(train_bundle: D.TraceBundle, reference_bundle: D.TraceBundle, seed: int) -> Dict[int, Tensor]:
+    """Algorithm-1 finite-sample approximation of dD_i/dP reweighting."""
+    from conformal import deployable_covariates, fit_density_ratio
+
+    reference_inputs = inputs_from_bundle(reference_bundle, 60.0)
+    reference_features = deployable_covariates(reference_inputs)
+    result: Dict[int, Tensor] = {}
+    for group in sorted(train_bundle.groups()):
+        mask = train_bundle.group_id == group
+        group_inputs = ForecastInputs(
+            reference_inputs.t,
+            inputs_from_bundle(train_bundle, 60.0).I_early[mask],
+            train_bundle.T_ambient[mask],
+            train_bundle.RH[mask],
+        )
+        ratio = fit_density_ratio(reference_features, deployable_covariates(group_inputs), seed + group)
+        result[group] = _systematic_indices(ratio.weights(reference_features), int(mask.sum()))
+    return result
+
+
+def _wr_training_loss(
+    model: LatentODEForecaster,
+    train_bundle: D.TraceBundle,
+    reference_bundle: D.TraceBundle,
+    train_inputs: ForecastInputs,
+    reference_inputs: ForecastInputs,
+    resamples: Dict[int, Tensor],
+) -> Tuple[Tensor, Dict[str, float]]:
+    combined = _combine_inputs(train_inputs, reference_inputs)
+    t_eval = torch.cat([combined.t, torch.tensor([900.0], dtype=combined.t.dtype)])
+    _, prediction = model.integrate(combined, t_eval, use_adjoint=True)
+    n_train = len(train_bundle)
+    train_endpoint = prediction[-1, :n_train]
+    reference_endpoint = prediction[-1, n_train:]
+    endpoint = torch.mean(((train_endpoint - train_bundle.true_I_900) / model.target_std) ** 2)
+    reconstruction = torch.mean(
+        ((prediction[:-1, :n_train].transpose(0, 1) - train_inputs.I_early) / model.encoder.I_noise) ** 2
+    )
+    train_scores = torch.abs(train_endpoint - train_bundle.true_I_900) / model.target_std
+    reference_scores = torch.abs(reference_endpoint - reference_bundle.true_I_900) / model.target_std
+    distances = []
+    for group, ref_index in resamples.items():
+        source = torch.sort(train_scores[train_bundle.group_id == group]).values
+        weighted_reference = torch.sort(reference_scores[ref_index]).values
+        distances.append(torch.mean(torch.abs(source - weighted_reference)))
+    wasserstein = torch.stack(distances).mean()
+    total = (
+        model.cfg.endpoint_weight * endpoint
+        + model.cfg.reconstruction_weight * reconstruction
+        + model.cfg.wr_beta * wasserstein
+    )
+    return total, {
+        "endpoint": float(endpoint.detach()),
+        "reconstruction": float(reconstruction.detach()),
+        "wasserstein": float(wasserstein.detach()),
+    }
+
+
+def train(
+    train_bundle: D.TraceBundle,
+    validation_bundle: D.TraceBundle,
+    cfg: TrainConfig,
+    wr_reference: Optional[D.TraceBundle] = None,
+) -> Dict:
     """Fit on ``train`` and select only on a disjoint validation split."""
     torch.manual_seed(cfg.seed)
     model = LatentODEForecaster(cfg)
@@ -225,12 +315,24 @@ def train(train_bundle: D.TraceBundle, validation_bundle: D.TraceBundle, cfg: Tr
     stale = 0
     history = {"train": [], "validation": [], "grad_norm": []}
     all_finite = True
+    resamples = None
+    if cfg.wr_beta > 0.0:
+        if wr_reference is None:
+            raise ValueError("wr_beta>0 requires a disjoint WR-reference bundle")
+        resamples = _wr_resamples(train_bundle, wr_reference, cfg.seed)
 
     for epoch in range(cfg.epochs):
         model.train()
         inputs = _prefix_for_epoch(train_bundle, cfg, epoch)
         optimizer.zero_grad()
-        loss, _ = _loss(model, train_bundle, inputs, use_adjoint=True)
+        if cfg.wr_beta > 0.0:
+            assert wr_reference is not None and resamples is not None
+            reference_inputs = _prefix_for_epoch(wr_reference, cfg, epoch)
+            loss, _ = _wr_training_loss(
+                model, train_bundle, wr_reference, inputs, reference_inputs, resamples
+            )
+        else:
+            loss, _, _ = _loss(model, train_bundle, inputs, use_adjoint=True)
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(parameters, cfg.grad_clip)
         if not torch.isfinite(norm):
