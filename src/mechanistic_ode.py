@@ -76,8 +76,8 @@ class MechanisticODE(nn.Module):
         if cfg.dynamics == "physics_only":
             self.freeze_residual(True)
 
-        self.register_buffer("T_ambient", torch.tensor(float(cfg.res_mean[3])))
-        self.register_buffer("RH", torch.tensor(float(cfg.res_mean[4])))
+        self.register_buffer("T_ambient", torch.tensor(float(cfg.res_mean[3])), persistent=False)
+        self.register_buffer("RH", torch.tensor(float(cfg.res_mean[4])), persistent=False)
         self.register_buffer("res_mean", torch.tensor(cfg.res_mean, dtype=torch.float32))
         self.register_buffer("res_scale", torch.tensor(cfg.res_scale, dtype=torch.float32))
         self.register_buffer("capture_area_m2", torch.tensor(float(cfg.capture_area_m2)))
